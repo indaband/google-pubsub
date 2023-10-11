@@ -27,3 +27,49 @@ func StringEnvSuiteCase(t *testing.T) {
 		assert.Equal(t, time.Second, duration)
 	})
 }
+
+func TestStringEnv_ParseToInt(t *testing.T) {
+	type args struct {
+		value        string
+		defaultValue int
+	}
+	tests := []struct {
+		name string
+		s    gp.StringEnv
+		args args
+		want int
+	}{
+		{
+			name: "it should convert to given number",
+			s:    gp.String(),
+			args: args{
+				value:        "10",
+				defaultValue: 1,
+			},
+			want: 10,
+		},
+		{
+			name: "it should grab default value in case of invalid one",
+			s:    gp.String(),
+			args: args{
+				value:        "fake",
+				defaultValue: 1,
+			},
+			want: 1,
+		},
+		{
+			name: "it should grab default value in case empty value",
+			s:    gp.String(),
+			args: args{
+				value:        "",
+				defaultValue: 21,
+			},
+			want: 21,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equalf(t, tt.want, tt.s.ParseToInt(tt.args.value, tt.args.defaultValue), "ParseToInt(%v, %v)", tt.args.value, tt.args.defaultValue)
+		})
+	}
+}

@@ -33,6 +33,7 @@ type (
 		ProjectID       string
 		DispatchTimeout time.Duration
 		tickerTime      time.Duration
+		PullingQuantity int32
 	}
 )
 
@@ -114,7 +115,7 @@ func (p *PubSub) createTopic(ctx context.Context, l Listener) error {
 func (p *PubSub) pullMessages(ctx context.Context, listener Listener, subscription *pubsubpb.Subscription) {
 	response, err := p.subscriberClient.Pull(ctx, &pubsubpb.PullRequest{
 		Subscription: subscription.Name,
-		MaxMessages:  30,
+		MaxMessages:  p.config.PullingQuantity,
 	})
 	if err != nil {
 		if ErrCodeAlias(status.Convert(err).Code()).IsDeadLineOrCanceledError() {
@@ -227,6 +228,7 @@ func LoadFromEnv(pbc *PubSubConfig) {
 	pbc.ProjectID = os.Getenv("PROJECT_ID")
 	pbc.DispatchTimeout = String().ParseToDuration(os.Getenv("EVENT_DISPATCH_TIMEOUT"), time.Millisecond*500)
 	pbc.tickerTime = String().ParseToDuration(os.Getenv("EVENT_PULL_TICKER_TIME"), time.Second)
+	pbc.PullingQuantity = int32(String().ParseToInt(os.Getenv("EVENT_PULLING_SIZE"), 30))
 }
 
 // ConnectPubSub enable to connect data from it
