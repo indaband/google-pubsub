@@ -1,6 +1,9 @@
 package google_pubsub
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 // StringEnv enable to parse string over other type
 type StringEnv func()
@@ -17,4 +20,15 @@ func (s StringEnv) ParseToDuration(value string, defaultValue time.Duration) tim
 		return defaultValue
 	}
 	return result
+}
+
+func (s StringEnv) ParseToInt(value string, defaultValue int) int {
+	converted, err := strconv.
+		ParseInt(value, 10, 64)
+
+	if err != nil {
+		return defaultValue
+	}
+
+	return int(converted)
 }
