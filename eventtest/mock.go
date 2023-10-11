@@ -1,9 +1,21 @@
 package eventtest
 
-import "github.com/stretchr/testify/mock"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/mock"
+)
 
 type MockListener struct {
 	mock.Mock
+}
+
+func NewMockListener(t *testing.T) *MockListener {
+	m := new(MockListener)
+	t.Cleanup(func() {
+		m.AssertExpectations(t)
+	})
+	return m
 }
 
 func (m *MockListener) EventName() string {
@@ -31,6 +43,14 @@ func (m *MockListener) OnError(err error, metadata map[string]string) {
 
 type MockNotifier struct {
 	mock.Mock
+}
+
+func NewMockNotifier(t *testing.T) *MockNotifier {
+	m := new(MockNotifier)
+	t.Cleanup(func() {
+		m.AssertExpectations(t)
+	})
+	return m
 }
 
 func (mn *MockNotifier) Dispatch(name string, data []byte, metadata map[string]string) error {
