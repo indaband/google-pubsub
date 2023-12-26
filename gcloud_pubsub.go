@@ -232,6 +232,7 @@ func (p *PubSub) Subscribe(ctx context.Context, listeners ...Listener) error {
 	return nil
 }
 
+// SubscribeWithEnhancement allow to include advanced configuration on listener such as early ack options.
 func (p *PubSub) SubscribeWithEnhancement(ctx context.Context, listeners ...AdvancedPubSubListener) error {
 	p.listeners = append(p.listeners, listeners...)
 	for _, listener := range listeners {
