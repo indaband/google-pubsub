@@ -25,7 +25,7 @@ type (
 	PubSub struct {
 		publisherClient  *pubsub.PublisherClient
 		subscriberClient *pubsub.SubscriberClient
-		listeners        []Listener
+		listeners        []AdvancedPubSubListener
 		config           *PubSubConfig
 	}
 
@@ -112,7 +112,7 @@ func (p *PubSub) createTopic(ctx context.Context, l Listener) error {
 	return nil
 }
 
-func (p *PubSub) pullMessages(ctx context.Context, listener Listener, subscription *pubsubpb.Subscription) {
+func (p *PubSub) pullMessages(ctx context.Context, listener AdvancedPubSubListener, subscription *pubsubpb.Subscription) {
 	response, err := p.subscriberClient.Pull(ctx, &pubsubpb.PullRequest{
 		Subscription: subscription.Name,
 		MaxMessages:  p.config.PullingQuantity,
@@ -143,6 +143,15 @@ func (p *PubSub) pullMessages(ctx context.Context, listener Listener, subscripti
 					}
 				}
 			}(listener)
+
+			if listener.EarlyAckEnabled() {
+				_ = p.subscriberClient.
+					Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{
+						Subscription: subscription.Name,
+						AckIds:       []string{message.AckId},
+					})
+			}
+
 			if err := listener.
 				Caller(message.Message.Data, message.Message.Attributes); err != nil {
 				listener.
@@ -163,11 +172,14 @@ func (p *PubSub) pullMessages(ctx context.Context, listener Listener, subscripti
 					})
 				return
 			}
-			_ = p.subscriberClient.
-				Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{
-					Subscription: subscription.Name,
-					AckIds:       []string{message.AckId},
-				})
+
+			if listener.EarlyAckEnabled() {
+				_ = p.subscriberClient.
+					Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{
+						Subscription: subscription.Name,
+						AckIds:       []string{message.AckId},
+					})
+			}
 			listener.OnSuccess(message.Message.Attributes)
 		}()
 	}
@@ -176,11 +188,55 @@ func (p *PubSub) pullMessages(ctx context.Context, listener Listener, subscripti
 // Subscribe configures listeners to receive messages from a Pub/Sub topic.
 // It respects the Listener interface.
 func (p *PubSub) Subscribe(ctx context.Context, listeners ...Listener) error {
-	p.listeners = append(p.listeners, listeners...)
+	for _, listener := range listeners {
+		eListener := NewEnhancedListener(listener, false)
+		p.listeners = append(p.listeners, eListener)
+		// Launch a new goroutine for each listener.
+		go func(l AdvancedPubSubListener) {
+			// Initialize a ticker based on configuration.
+			ticker := time.NewTicker(p.config.tickerTime)
+			defer ticker.Stop()
 
+			for {
+				select {
+				// Try to get or create subscription when the ticker fires.
+				case <-ticker.C:
+					sub, err := p.getOrCreateSubscription(ctx, l.EventName(), l.GroupID())
+					if err != nil {
+						errCode := status.Convert(err).Code()
+						switch errCode {
+						case codes.NotFound:
+							if createErr := p.
+								createTopic(ctx, l); createErr != nil &&
+								!ErrCodeAlias(status.Convert(createErr).Code()).AlreadyExists() {
+								l.OnError(fmt.Errorf("subscription: %w", createErr), map[string]string{})
+							}
+						case codes.Canceled:
+							// Do nothing for a canceled context.
+						default:
+							l.OnError(fmt.Errorf("subscription: %w", err), map[string]string{})
+						}
+						continue
+					}
+					p.pullMessages(ctx, l, sub)
+
+				// Stop the goroutine if the context is done.
+				case <-ctx.Done():
+					ticker.Stop()
+					_ = p.subscriberClient.Close()
+					return
+				}
+			}
+		}(eListener)
+	}
+	return nil
+}
+
+func (p *PubSub) SubscribeWithEnhancement(ctx context.Context, listeners ...AdvancedPubSubListener) error {
+	p.listeners = append(p.listeners, listeners...)
 	for _, listener := range listeners {
 		// Launch a new goroutine for each listener.
-		go func(l Listener) {
+		go func(l AdvancedPubSubListener) {
 			// Initialize a ticker based on configuration.
 			ticker := time.NewTicker(p.config.tickerTime)
 			defer ticker.Stop()
@@ -274,6 +330,6 @@ func ConnectPubSub(opts ...PubSubOptions) (*PubSub, error) {
 
 	return &PubSub{
 		publisherClient: pubc, subscriberClient: subc,
-		config: &config, listeners: make([]Listener, 0, 20),
+		config: &config, listeners: make([]AdvancedPubSubListener, 0, 20),
 	}, nil
 }

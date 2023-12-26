@@ -19,13 +19,22 @@ type Notifier interface {
 	Close()
 }
 
-type Listener interface {
-	EventName() string
-	GroupID() string
-	Caller([]byte, map[string]string) error
-	OnSuccess(metadata map[string]string)
-	OnError(err error, metadata map[string]string)
-}
+type (
+	// Listener Deprecated please use AdvancedPubSubListener instead.
+	//To allow compatibility please use NewAdvancedPubSubListener(oldListener Listener, true)
+	Listener interface {
+		EventName() string
+		GroupID() string
+		Caller([]byte, map[string]string) error
+		OnSuccess(metadata map[string]string)
+		OnError(err error, metadata map[string]string)
+	}
+
+	AdvancedPubSubListener interface {
+		Listener
+		EarlyAckEnabled() bool
+	}
+)
 
 type Event struct {
 	MaxRetries uint64
