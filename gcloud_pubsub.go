@@ -174,12 +174,15 @@ func (p *PubSub) pullMessages(ctx context.Context, listener AdvancedPubSubListen
 			}
 
 			if listener.EarlyAckEnabled() {
-				_ = p.subscriberClient.
-					Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{
-						Subscription: subscription.Name,
-						AckIds:       []string{message.AckId},
-					})
+				listener.OnSuccess(message.Message.Attributes)
+				return
 			}
+
+			_ = p.subscriberClient.
+				Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{
+					Subscription: subscription.Name,
+					AckIds:       []string{message.AckId},
+				})
 			listener.OnSuccess(message.Message.Attributes)
 		}()
 	}
