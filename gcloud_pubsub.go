@@ -2,29 +2,24 @@ package google_pubsub
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"time"
 
-	pubsubV0 "cloud.google.com/go/pubsub"
-	pubsub "cloud.google.com/go/pubsub/apiv1"
-	"cloud.google.com/go/pubsub/apiv1/pubsubpb"
-	"github.com/google/uuid"
+	pubsub "cloud.google.com/go/pubsub"
+	"github.com/go-playground/validator/v10"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
-	"google.golang.org/grpc/status"
 )
 
-// PubSub implements notifier interface
+// LegacyPubSub implements notifier interface
 type (
-	PubSub struct {
-		publisherClient  *pubsub.PublisherClient
-		subscriberClient *pubsub.SubscriberClient
+	LegacyPubSub struct {
+		publisherClient  Publisher
+		subscriberClient *Subscription
 		listeners        []AdvancedPubSubListener
 		config           *PubSubConfig
 	}
@@ -33,251 +28,70 @@ type (
 		ProjectID       string
 		DispatchTimeout time.Duration
 		tickerTime      time.Duration
+		//Deprecated: PullingQuantity is no longer needed, since we are streaming message instead.
 		PullingQuantity int32
 	}
 )
 
-func (p *PubSub) Dispatch(name string, data []byte, metadata map[string]string) error {
+// Deprecated: Dispatch PLEASE DO NOT use it anymore. Instead, call Send(ctx context.Context, message *Message) error
+func (p *LegacyPubSub) Dispatch(name string, data []byte, metadata map[string]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), p.config.DispatchTimeout)
 	defer cancel()
-	channel := make(chan struct{ err error }, 1)
-	go func() {
-		defer close(channel)
-		topic := fmt.Sprintf("projects/%s/topics/%s", p.config.ProjectID, name)
-		req := pubsubpb.PublishRequest{
-			Topic: topic,
-			Messages: []*pubsubpb.PubsubMessage{
-				{
-					MessageId:  uuid.New().String(),
-					Data:       data,
-					Attributes: metadata,
-				},
-			},
-		}
+	return p.publisherClient.Send(ctx, &Message{
+		Topic:   name,
+		Headers: metadata,
+		Content: NewContent(data),
+	})
+}
 
-		_, err := p.publisherClient.Publish(ctx, &req)
-		channel <- struct{ err error }{err}
-	}()
-	select {
-	case result := <-channel:
-		return result.err
-	case <-ctx.Done():
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("operation timeout, could not dispatch event to topic %s after %s %v", name, p.config.DispatchTimeout.String(), ctx.Err())
-		}
-		return fmt.Errorf("operation cancelled: could not dispatch event to topic %s after %s: %v", name, p.config.DispatchTimeout.String(), ctx.Err())
-	}
+func (p *LegacyPubSub) Send(ctx context.Context, message *Message) error {
+	return p.publisherClient.Send(ctx, message)
 }
 
 // Close all remain connections and release resource
-func (p *PubSub) Close() {
-	_ = p.publisherClient.Close()
-	_ = p.subscriberClient.Close()
+func (p *LegacyPubSub) Close() {
+	_ = p.publisherClient.Close(context.Background())
+	_ = p.subscriberClient.Close(context.Background())
 }
 
-func (p *PubSub) getOrCreateSubscription(ctx context.Context, topic, name string) (*pubsubpb.Subscription, error) {
-	subscriptionName := fmt.Sprintf("projects/%s/subscriptions/%s", p.config.ProjectID, name)
-	topicFullName := fmt.Sprintf("projects/%s/topics/%s", p.config.ProjectID, topic)
-
-	sub, err := p.subscriberClient.GetSubscription(
-		ctx, &pubsubpb.GetSubscriptionRequest{
-			Subscription: subscriptionName,
+// Deprecated: Subscribe please stop using it instead, call Register(ctx context.Context, sub ...*Subscribers)error
+func (p *LegacyPubSub) Subscribe(ctx context.Context, listeners ...Listener) error {
+	subscribers := make([]*Subscriber, len(listeners))
+	for _, listener := range listeners {
+		subscribers = append(subscribers, &Subscriber{
+			Config: SubscriptionConfig{
+				AckDeadline:               time.Minute,
+				EarlyAck:                  false,
+				Topics:                    []string{listener.EventName()},
+				SubscriptionID:            listener.GroupID(),
+				EnableExactlyOnceDelivery: true,
+			},
 		})
-
-	if err != nil {
-		return p.subscriberClient.CreateSubscription(
-			ctx, &pubsubpb.Subscription{
-				Name:  subscriptionName,
-				Topic: topicFullName,
-			})
 	}
-	return sub, nil
+
+	return p.subscriberClient.Register(ctx, subscribers...)
 }
 
-func (p *PubSub) createTopic(ctx context.Context, l Listener) error {
-	cli, err := pubsubV0.
-		NewClient(ctx, p.config.ProjectID)
-
-	if err != nil {
-		return fmt.Errorf("fail to create topic '%s' %w", l.EventName(), err)
-	}
-
-	defer func() { _ = cli.Close() }()
-
-	if _, err := cli.
-		CreateTopic(ctx, l.EventName()); err != nil {
-		return fmt.Errorf("fail to create topic '%s' %w", l.EventName(), err)
-	}
-
-	return nil
-}
-
-func (p *PubSub) pullMessages(ctx context.Context, listener AdvancedPubSubListener, subscription *pubsubpb.Subscription) {
-	response, err := p.subscriberClient.Pull(ctx, &pubsubpb.PullRequest{
-		Subscription: subscription.Name,
-		MaxMessages:  p.config.PullingQuantity,
-	})
-	if err != nil {
-		if ErrCodeAlias(status.Convert(err).Code()).IsDeadLineOrCanceledError() {
-			return
-		}
-		listener.
-			OnError(
-				fmt.Errorf("fail to pull message from subscription '%s' on topic '%s' %w", subscription.Name, subscription.Topic, err),
-				map[string]string{},
-			)
-		return
-	}
-	if len(response.ReceivedMessages) == 0 {
-		return
-	}
-
-	for _, message := range response.ReceivedMessages {
-		func() {
-			defer func(listener Listener) {
-				if r := recover(); r != nil {
-					if recoveryError, ok := r.(error); ok {
-						listener.OnError(recoveryError, message.Message.Attributes)
-					} else if errorMsg, ok := r.(string); ok {
-						listener.OnError(errors.New(errorMsg), message.Message.Attributes)
-					}
-				}
-			}(listener)
-
-			if listener.EarlyAckEnabled() {
-				_ = p.subscriberClient.
-					Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{
-						Subscription: subscription.Name,
-						AckIds:       []string{message.AckId},
-					})
-			}
-
-			if err := listener.
-				Caller(message.Message.Data, message.Message.Attributes); err != nil {
-				listener.
-					OnError(err, message.Message.Attributes)
-				if ok := errors.Is(err, PubsubError{}); ok {
-					var pubSubError PubsubError
-					if errors.As(err, &pubSubError) {
-						if pubSubError.Retriable() {
-							// TODO: figure out how to do with retry. For now on we will not retry any error
-							return
-						}
-					}
-				}
-				_ = p.subscriberClient.
-					Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{
-						Subscription: subscription.Name,
-						AckIds:       []string{message.AckId},
-					})
-				return
-			}
-
-			if listener.EarlyAckEnabled() {
-				listener.OnSuccess(message.Message.Attributes)
-				return
-			}
-
-			_ = p.subscriberClient.
-				Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{
-					Subscription: subscription.Name,
-					AckIds:       []string{message.AckId},
-				})
-			listener.OnSuccess(message.Message.Attributes)
-		}()
-	}
-}
-
-// Subscribe configures listeners to receive messages from a Pub/Sub topic.
-// It respects the Listener interface.
-func (p *PubSub) Subscribe(ctx context.Context, listeners ...Listener) error {
+// Deprecated: SubscribeWithEnhancement allow to include advanced configuration on listener such as early ack options.
+// Please DO NOT USE IT ANYMORE, instead use Register(ctx context.Context, sub ...*Subscribers)error
+func (p *LegacyPubSub) SubscribeWithEnhancement(ctx context.Context, listeners ...AdvancedPubSubListener) error {
+	subscribers := make([]*Subscriber, len(listeners))
 	for _, listener := range listeners {
-		eListener := NewEnhancedListener(listener, false)
-		p.listeners = append(p.listeners, eListener)
-		// Launch a new goroutine for each listener.
-		go func(l AdvancedPubSubListener) {
-			// Initialize a ticker based on configuration.
-			ticker := time.NewTicker(p.config.tickerTime)
-			defer ticker.Stop()
-
-			for {
-				select {
-				// Try to get or create subscription when the ticker fires.
-				case <-ticker.C:
-					sub, err := p.getOrCreateSubscription(ctx, l.EventName(), l.GroupID())
-					if err != nil {
-						errCode := status.Convert(err).Code()
-						switch errCode {
-						case codes.NotFound:
-							if createErr := p.
-								createTopic(ctx, l); createErr != nil &&
-								!ErrCodeAlias(status.Convert(createErr).Code()).AlreadyExists() {
-								l.OnError(fmt.Errorf("subscription: %w", createErr), map[string]string{})
-							}
-						case codes.Canceled:
-							// Do nothing for a canceled context.
-						default:
-							l.OnError(fmt.Errorf("subscription: %w", err), map[string]string{})
-						}
-						continue
-					}
-					p.pullMessages(ctx, l, sub)
-
-				// Stop the goroutine if the context is done.
-				case <-ctx.Done():
-					ticker.Stop()
-					_ = p.subscriberClient.Close()
-					return
-				}
-			}
-		}(eListener)
+		subscribers = append(subscribers, &Subscriber{
+			Config: SubscriptionConfig{
+				AckDeadline:               time.Minute,
+				EarlyAck:                  listener.EarlyAckEnabled(),
+				Topics:                    []string{listener.EventName()},
+				SubscriptionID:            listener.GroupID(),
+				EnableExactlyOnceDelivery: true,
+			},
+		})
 	}
-	return nil
+	return p.subscriberClient.Register(ctx, subscribers...)
 }
 
-// SubscribeWithEnhancement allow to include advanced configuration on listener such as early ack options.
-func (p *PubSub) SubscribeWithEnhancement(ctx context.Context, listeners ...AdvancedPubSubListener) error {
-	p.listeners = append(p.listeners, listeners...)
-	for _, listener := range listeners {
-		// Launch a new goroutine for each listener.
-		go func(l AdvancedPubSubListener) {
-			// Initialize a ticker based on configuration.
-			ticker := time.NewTicker(p.config.tickerTime)
-			defer ticker.Stop()
-
-			for {
-				select {
-				// Try to get or create subscription when the ticker fires.
-				case <-ticker.C:
-					sub, err := p.getOrCreateSubscription(ctx, l.EventName(), l.GroupID())
-					if err != nil {
-						errCode := status.Convert(err).Code()
-						switch errCode {
-						case codes.NotFound:
-							if createErr := p.
-								createTopic(ctx, l); createErr != nil &&
-								!ErrCodeAlias(status.Convert(createErr).Code()).AlreadyExists() {
-								l.OnError(fmt.Errorf("subscription: %w", createErr), map[string]string{})
-							}
-						case codes.Canceled:
-							// Do nothing for a canceled context.
-						default:
-							l.OnError(fmt.Errorf("subscription: %w", err), map[string]string{})
-						}
-						continue
-					}
-					p.pullMessages(ctx, l, sub)
-
-				// Stop the goroutine if the context is done.
-				case <-ctx.Done():
-					ticker.Stop()
-					_ = p.subscriberClient.Close()
-					return
-				}
-			}
-		}(listener)
-	}
-	return nil
+func (p *LegacyPubSub) Register(ctx context.Context, subscribers ...*Subscriber) error {
+	return p.subscriberClient.Register(ctx, subscribers...)
 }
 
 // PubSubOptions enable to customize configuration
@@ -292,7 +106,7 @@ func LoadFromEnv(pbc *PubSubConfig) {
 }
 
 // ConnectPubSub enable to connect data from it
-func ConnectPubSub(opts ...PubSubOptions) (*PubSub, error) {
+func ConnectPubSub(opts ...PubSubOptions) (*LegacyPubSub, error) {
 	var config PubSubConfig
 	for _, opt := range opts {
 		opt(&config)
@@ -302,7 +116,6 @@ func ConnectPubSub(opts ...PubSubOptions) (*PubSub, error) {
 	// Environment variables for gcloud emulator:
 	// https://cloud.google.com/sdk/gcloud/reference/beta/emulators/pubsub/
 	if addr := os.Getenv("PUBSUB_EMULATOR_HOST"); addr != "" {
-		fmt.Println(addr)
 		conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return nil, fmt.Errorf("grpc.Dial: %v", err)
@@ -323,17 +136,23 @@ func ConnectPubSub(opts ...PubSubOptions) (*PubSub, error) {
 		}
 	}
 
-	pubc, err := pubsub.NewPublisherClient(context.Background(), o...)
+	client, err := pubsub.NewClient(context.Background(), config.ProjectID, o...)
 	if err != nil {
-		return nil, fmt.Errorf("pubsub(publisher): %v", err)
-	}
-	subc, err := pubsub.NewSubscriberClient(context.Background(), o...)
-	if err != nil {
-		return nil, fmt.Errorf("pubsub(subscriber): %v", err)
+		return nil, fmt.Errorf("pubsub(client): %w", err)
 	}
 
-	return &PubSub{
-		publisherClient: pubc, subscriberClient: subc,
-		config: &config, listeners: make([]AdvancedPubSubListener, 0, 20),
+	return &LegacyPubSub{
+		publisherClient: Publisher{
+			config:    PublisherConfig{ProjectID: config.ProjectID},
+			provider:  client,
+			validator: validator.New(),
+		},
+		subscriberClient: &Subscription{
+			subscribers: make(Subscribers, 0, 100),
+			projectID:   config.ProjectID,
+			client:      client,
+		},
+		config:    &config,
+		listeners: make([]AdvancedPubSubListener, 0, 100),
 	}, nil
 }

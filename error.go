@@ -1,6 +1,14 @@
 package google_pubsub
 
-import "google.golang.org/grpc/codes"
+import (
+	"errors"
+
+	"google.golang.org/grpc/codes"
+)
+
+var (
+	ErrValidation = errors.New("validation error")
+)
 
 // PubsubError is the struct which implements error
 type (
