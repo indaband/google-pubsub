@@ -302,7 +302,6 @@ func ConnectPubSub(opts ...PubSubOptions) (*PubSub, error) {
 	// Environment variables for gcloud emulator:
 	// https://cloud.google.com/sdk/gcloud/reference/beta/emulators/pubsub/
 	if addr := os.Getenv("PUBSUB_EMULATOR_HOST"); addr != "" {
-		fmt.Println(addr)
 		conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return nil, fmt.Errorf("grpc.Dial: %v", err)
